@@ -22,6 +22,7 @@ in [ROADMAP.md](ROADMAP.md).
 
 ### Fixed
 
+- A new tab opened from a private tab is private too: ⌘T, ⌘-click on a link, ⌘D, Open Image in New Tab, and a bookmark opened with ⌘ used to open an ordinary tab, which kept the page in the history. A link or duplicate stays signed in to what the private tab was ([#121](https://github.com/driceroland/Search/issues/121))
 - The stand-in traffic lights drawn while Search is in the background are no longer redrawn each time the window changes screen or size, only when they move.
 - An empty tab no longer works the processor while it waits: the slow breath under the address field was redrawn by the app every frame, about a sixth of a core with nothing happening. The same breath now runs in macOS's own animation layer, at no cost to Search.
 - With extensions installed, the window no longer waits for them: they load once it is up. The first launch after an update, when Search fits its Chrome compatibility layer to each extension again, does that away from the main thread — with Grammarly, the window had stood still for half a second. Thanks [@andupoto](https://x.com/andupoto) for the report
