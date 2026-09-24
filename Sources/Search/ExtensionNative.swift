@@ -91,6 +91,12 @@ enum ExtensionNative {
         }
         port.messageHandler = { message, _ in
             guard let message else { return }
+            // A worker's shim asking whether the port has arrived (see the
+            // shim, after its WebSocket): answered here, never passed on.
+            if let asked = message as? [String: Any], asked["__searchNative"] != nil {
+                port.sendMessage(["__searchNative": "here"], completionHandler: nil)
+                return
+            }
             try? pipe.write(message)
         }
         port.disconnectHandler = { _ in pipe.stop() }
@@ -141,6 +147,10 @@ final class HostPipe: @unchecked Sendable {
         process.standardInput = input
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
+        // A host that is already gone — refused to run, killed as it
+        // started — would take the browser with it: writing to its closed
+        // pipe raises SIGPIPE. Refused, the write only fails.
+        _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
     }
 
     func start() throws {

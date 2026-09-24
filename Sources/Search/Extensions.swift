@@ -890,6 +890,9 @@ extension Extensions: WKWebExtensionControllerDelegate {
             ExtensionSocket.connect(port, from: extensionContext.uniqueIdentifier)
             return
         }
+        // The port a worker's shim opens only to find what ports share; it
+        // lets go at once.
+        if port.applicationIdentifier == ExtensionShims.application { return }
         try ExtensionNative.connect(port, from: extensionContext.uniqueIdentifier)
     }
 }

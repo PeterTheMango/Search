@@ -465,6 +465,90 @@ enum ExtensionShims {
         for (const [k, v] of Object.entries(states)) { Object.defineProperty(WebSocket, k, { value: v }); Object.defineProperty(WebSocket.prototype, k, { value: v }); }
         Object.defineProperty(root, "WebSocket", { value: WebSocket, configurable: true, writable: true });
       }
+      // The same loss meets a worker's port to an app on the Mac: what it
+      // posts in its first moments never reaches the app, and comes back to
+      // the worker's own listeners instead. iCloud Passwords says hello to
+      // its helper that way, and without the helper's answer asks for the
+      // code again and again. So on such a port, what the extension posts
+      // is held from its first message until the browser says the port has
+      // arrived — asked on the same port, as the socket asks — and then sent
+      // in order. WebKit won't let connectNative be replaced in a worker, so
+      // this is done on what every port shares, found through a port to the
+      // browser itself; the question and the answer are kept from the
+      // extension's listeners, and never reach the app.
+      if (worker && runtime && typeof runtime.connectNative === "function") {
+        let found = null;
+        try { found = runtime.connectNative("search"); found.disconnect(); } catch (e) {}
+        const portProto = found && Object.getPrototypeOf(found);
+        const eventProto = found && found.onMessage && Object.getPrototypeOf(found.onMessage);
+        if (portProto && eventProto && typeof portProto.postMessage === "function" && typeof eventProto.addListener === "function") {
+          // Ports that go to the extension's own pages or tabs, not an app.
+          const toPages = new WeakSet();
+          for (const [space, name] of [[runtime, "connect"], [chrome.tabs, "connect"]]) {
+            const connect = space && space[name];
+            if (typeof connect !== "function") continue;
+            put(space, name, (...args) => { const port = connect.apply(space, args); try { toPages.add(port); } catch (e) {} return port; });
+          }
+          const post = portProto.postMessage, add = eventProto.addListener, remove = eventProto.removeListener, has = eventProto.hasListener;
+          const ours = (m) => !!m && typeof m === "object" && "__searchNative" in m;
+          // Ports seen, each with what waits to be sent (null once it may go).
+          const ports = new WeakMap();
+          // The onMessage of each port held, whose questions and answers are hidden.
+          const hiding = new WeakSet();
+          const start = (port) => {
+            const state = { held: [] };
+            hiding.add(port.onMessage);
+            let tries = 0;
+            const flush = () => { const list = state.held; state.held = null; for (const m of list || []) post.call(port, m); };
+            const again = () => {
+              if (!state.held) return;
+              // Unanswered, they go anyway: no worse than before.
+              if (tries++ >= 20) { flush(); return; }
+              try { post.call(port, { __searchNative: "here?" }); } catch (e) {}
+              setTimeout(again, 100 * Math.min(tries, 5));
+            };
+            add.call(port.onMessage, (m) => { if (m && m.__searchNative === "here" && state.held) flush(); });
+            add.call(port.onDisconnect, () => { state.held = null; });
+            again();
+            return state;
+          };
+          put(portProto, "postMessage", function (message) {
+            let state = ports.get(this);
+            if (!state) {
+              const native = !toPages.has(this) && this.sender == null && typeof this.name === "string" && !/^search(\.|$)/.test(this.name);
+              state = native ? start(this) : { held: null };
+              ports.set(this, state);
+            }
+            if (state.held) { state.held.push(message); return; }
+            return post.call(this, message);
+          });
+          // A port's listeners, and only a port's (the namespaces' own
+          // events are kept as they are), each behind one that lets the
+          // question and the answer pass by.
+          const wrapped = new WeakMap();
+          const wrapper = (event, f, make) => {
+            let byEvent = wrapped.get(event);
+            if (!byEvent) { byEvent = new Map(); if (make) wrapped.set(event, byEvent); }
+            let w = byEvent.get(f);
+            if (!w && make) { w = function (m, ...rest) { if (hiding.has(event) && ours(m)) return; return f.call(this, m, ...rest); }; byEvent.set(f, w); }
+            return w;
+          };
+          put(eventProto, "addListener", function (f) {
+            if (kept.has(this) || typeof f !== "function") return add.call(this, f);
+            return add.call(this, wrapper(this, f, true));
+          });
+          put(eventProto, "removeListener", function (f) {
+            const w = !kept.has(this) && typeof f === "function" && wrapper(this, f, false);
+            if (!w) return remove.call(this, f);
+            wrapped.get(this).delete(f);
+            return remove.call(this, w);
+          });
+          put(eventProto, "hasListener", function (f) {
+            const w = !kept.has(this) && typeof f === "function" && wrapper(this, f, false);
+            return has.call(this, w || f);
+          });
+        }
+      }
       // WebKit gives a worker the user agent of the last web page that set
       // one — Safari's, as Search's tabs send — not the Chrome one the
       // extension's pages have. Code that picks its path by it then takes
