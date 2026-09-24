@@ -26,6 +26,9 @@ enum ExtensionShims {
     /// The name native messages to the browser itself go to.
     static let application = "search"
     nonisolated static let file = "search-shim.js"
+    /// Search's passkey patch, put first in every script an extension runs in
+    /// a page's own world (see Passkeys.swift, and `first` in the script).
+    nonisolated static let passkeys = "search-passkeys.js"
     /// The first line of a worker that already carries the shim.
     nonisolated static let marker = "/* Search: Chrome APIs WebKit lacks, filled in (ExtensionShims.swift) */"
     nonisolated static let ender = "/* Search: end of shim */"
@@ -37,7 +40,7 @@ enum ExtensionShims {
     /// every script and page an extension ships.
     nonisolated static let stamp = ".search-shim"
     nonisolated static let version: String = {
-        SHA256.hash(data: Data(script.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined() + (Store.testing ? "-test" : "")
+        SHA256.hash(data: Data((script + PasskeyRelay.script).utf8)).prefix(8).map { String(format: "%02x", $0) }.joined() + (Store.testing ? "-test" : "")
     }()
 
     nonisolated static func prepare(_ folder: URL) throws {
@@ -51,6 +54,7 @@ enum ExtensionShims {
 
         let script = shim(for: folder)
         try script.write(to: folder.appendingPathComponent(file), atomically: true, encoding: .utf8)
+        try PasskeyRelay.script.write(to: folder.appendingPathComponent(passkeys), atomically: true, encoding: .utf8)
 
         // Native messaging is how the shim reaches the browser; user scripts
         // are carried out through WebKit's registered content scripts, which
@@ -101,12 +105,17 @@ enum ExtensionShims {
             manifest["background"] = background
         }
 
-        // Content scripts too — there only the sendMessage mend applies.
+        // Content scripts too — there only the sendMessage mend applies. One
+        // that runs in the page's own world has Search's passkey patch before
+        // it: a password manager's there keeps a reference to
+        // navigator.credentials as it finds it, and that has to be Search's,
+        // not WebKit's (see Passkeys.swift).
         if let entries = manifest["content_scripts"] as? [[String: Any]] {
             manifest["content_scripts"] = entries.map { entry -> [String: Any] in
                 var entry = entry
-                if var js = entry["js"] as? [String], js.first != file {
-                    js.insert(file, at: 0)
+                if var js = entry["js"] as? [String] {
+                    if !js.contains(file) { js.insert(file, at: 0) }
+                    if (entry["world"] as? String)?.uppercased() == "MAIN", !js.contains(passkeys) { js.insert(passkeys, at: 0) }
                     entry["js"] = js
                 }
                 return entry
@@ -1591,6 +1600,24 @@ enum ExtensionShims {
       // than the extension's own onMessage. The list lives with the browser,
       // and is registered again whenever the worker starts.
       const scripting = chrome.scripting;
+      // What an extension registers for a page's own world has Search's
+      // passkey patch before it, as its manifest's do (see prepare): a
+      // password manager keeps a reference to navigator.credentials as it
+      // finds it, and falls back to that. An update that names no world gets
+      // it too; in any other world the patch does nothing.
+      if (scripting) {
+        const first = (scripts, updating) => Array.isArray(scripts) ? scripts.map((s) => {
+          if (!s || !Array.isArray(s.js) || s.js.includes("search-passkeys.js")) return s;
+          const world = String(s.world || "").toUpperCase();
+          return world === "MAIN" || (updating && !world) ? { ...s, js: ["search-passkeys.js", ...s.js] } : s;
+        }) : scripts;
+        for (const name of ["registerContentScripts", "updateContentScripts"]) {
+          const original = scripting[name];
+          if (typeof original === "function") {
+            put(scripting, name, function (scripts, ...rest) { return original.call(scripting, first(scripts, name === "updateContentScripts"), ...rest); });
+          }
+        }
+      }
       const wantsUserScripts = (() => { try { return (runtime.getManifest().permissions || []).includes("userScripts"); } catch (e) { return false; } })();
       if (!chrome.userScripts && wantsUserScripts && scripting && typeof scripting.registerContentScripts === "function") {
         const tag = "search-us-";
@@ -1759,6 +1786,63 @@ enum ExtensionShims {
             put(target, "removeListener", (listener) => { late.delete(listener); try { remove(listener); } catch (e) {} });
           }
         }
+      }
+
+      // What one of the extension's pages or its worker posts to another
+      // before their port has opened — at once after connect, or from inside
+      // onConnect — WebKit keeps until the other end takes the port, then
+      // hands on once for each end's world: between two of the extension's
+      // own, the same world, so twice. iCloud Passwords' popup asks its
+      // worker for its state that way, and was answered twice. So between
+      // the extension's own ends every message goes numbered by the end
+      // that sends it, and a number already heard is let go by. A content
+      // script's port, or an app's, goes as it is.
+      if (runtime && typeof runtime.connect === "function" && runtime.onConnect) {
+        const own = runtime.getURL("");
+        const numbered = new WeakSet();
+        // Set on the port itself, not with `put`, which holds what it touches
+        // for good: a port is the extension's to let go. Its onMessage is held
+        // by what is set here, so it isn't made afresh without it.
+        const set = (target, key, value) => { try { Object.defineProperty(target, key, { value, configurable: true, writable: true }); } catch (e) {} };
+        const number = (port) => {
+          const event = port && port.onMessage, post = port && port.postMessage;
+          if (!event || typeof event.addListener !== "function" || typeof post !== "function" || numbered.has(port)) return port;
+          numbered.add(port);
+          const me = Math.random().toString(36).slice(2);
+          let sent = 0;
+          const heard = new Map();
+          const listeners = new Set();
+          event.addListener.call(event, (message, ...rest) => {
+            const tag = message && typeof message === "object" ? message.__searchPort : null;
+            if (Array.isArray(tag)) {
+              if (tag[1] <= (heard.get(tag[0]) || 0)) return;
+              heard.set(tag[0], tag[1]);
+              message = message.message;
+            }
+            for (const f of [...listeners]) { try { f(message, ...rest); } catch (e) { setTimeout(() => { throw e; }); } }
+          });
+          set(port, "postMessage", (message) => post.call(port, { __searchPort: [me, ++sent], message }));
+          set(event, "addListener", (f) => { listeners.add(f); });
+          set(event, "removeListener", (f) => { listeners.delete(f); });
+          set(event, "hasListener", (f) => listeners.has(f));
+          set(event, "hasListeners", () => listeners.size > 0);
+          return port;
+        };
+        const connect = runtime.connect;
+        put(runtime, "connect", (...args) => number(connect.apply(runtime, args)));
+        const onConnect = runtime.onConnect;
+        const add = onConnect.addListener, remove = onConnect.removeListener, has = onConnect.hasListener;
+        const wrapped = new WeakMap();
+        // The worker's sender is the bare origin, with no slash after it.
+        const fromOwn = (port) => !!port && !!port.sender && (String(port.sender.url) + "/").startsWith(own);
+        put(onConnect, "addListener", (listener, ...rest) => {
+          if (typeof listener !== "function") return add.call(onConnect, listener, ...rest);
+          let w = wrapped.get(listener);
+          if (!w) { w = (port) => listener(fromOwn(port) ? number(port) : port); wrapped.set(listener, w); }
+          return add.call(onConnect, w, ...rest);
+        });
+        put(onConnect, "removeListener", (listener) => remove.call(onConnect, wrapped.get(listener) || listener));
+        put(onConnect, "hasListener", (listener) => has.call(onConnect, wrapped.get(listener) || listener));
       }
 
       // Members of namespaces WebKit has.
