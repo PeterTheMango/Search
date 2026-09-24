@@ -1945,6 +1945,13 @@ extension Browser: WKNavigationDelegate, WKUIDelegate {
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
         let from = tab(for: webView)?.id ?? activeID
+        // WebKit's copy of the opener's configuration still holds the
+        // opener's user content controller — its scripts and its message
+        // handlers. Shared, the new tab claimed the opener's handlers as its
+        // own, and closing or sleeping it took them off the opener's page:
+        // right-click on a picture on X, after following a link out of it,
+        // did nothing at all. Each tab gets a controller of its own.
+        configuration.userContentController = WKUserContentController()
         let tab = Tab(shy: tab(for: webView)?.shy ?? false, configuration: configuration)
         adopt(tab)
         tab.opener = from
@@ -1968,6 +1975,16 @@ extension Browser: WKNavigationDelegate, WKUIDelegate {
         // youtube.com and some servers do on their redirects.
         if let http = response.response as? HTTPURLResponse, (300...399).contains(http.statusCode) {
             decisionHandler(.allow)
+            return
+        }
+        // A server that says "attachment" means a file to keep, even one
+        // WebKit could show. Gmail's download button loads the attachment
+        // into a hidden frame and counts on exactly that: a PDF shown there
+        // instead was the button doing nothing at all.
+        if let http = response.response as? HTTPURLResponse,
+           let disposition = http.value(forHTTPHeaderField: "Content-Disposition"),
+           disposition.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("attachment") {
+            decisionHandler(.download)
             return
         }
         decisionHandler(response.canShowMIMEType ? .allow : .download)
