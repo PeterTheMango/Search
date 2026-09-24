@@ -78,6 +78,9 @@ enum ExtensionNative {
     static func connect(_ port: WKWebExtension.MessagePort, from extensionID: String) throws {
         guard let name = port.applicationIdentifier else { throw Refused(why: "No host named") }
         let program = try host(name, for: extensionID)
+        // A new port is often a worker starting over; the one before may
+        // have left its host behind.
+        stopOrphans()
         let pipe = HostPipe(program: program, origin: "chrome-extension://\(extensionID)/")
         try pipe.start()
         pipe.onMessage = { message in
@@ -91,14 +94,26 @@ enum ExtensionNative {
             try? pipe.write(message)
         }
         port.disconnectHandler = { _ in pipe.stop() }
-        Live.keep(pipe)
+        Live.keep(pipe, for: port)
+    }
+
+    /// WebKit doesn't always say when a port goes: an extension unloaded —
+    /// taken up afresh, turned off, removed — leaves its worker's ports
+    /// disconnected without calling their disconnect handlers. Each host
+    /// would run on, with any code prompt it had open, until the browser
+    /// quit: iCloud Passwords left a helper behind at every restart. So the
+    /// hosts of ports that have gone are stopped here; a port still
+    /// connected keeps its own.
+    @MainActor
+    static func stopOrphans() {
+        for (pipe, port) in Live.pipes.values where port.isDisconnected { pipe.stop() }
     }
 
     /// Hosts that are connected, held until they end.
     private enum Live {
-        nonisolated(unsafe) static var pipes: [ObjectIdentifier: HostPipe] = [:]
-        static func keep(_ pipe: HostPipe) {
-            pipes[ObjectIdentifier(pipe)] = pipe
+        nonisolated(unsafe) static var pipes: [ObjectIdentifier: (pipe: HostPipe, port: WKWebExtension.MessagePort)] = [:]
+        static func keep(_ pipe: HostPipe, for port: WKWebExtension.MessagePort) {
+            pipes[ObjectIdentifier(pipe)] = (pipe, port)
             let previous = pipe.onExit
             pipe.onExit = {
                 previous?()

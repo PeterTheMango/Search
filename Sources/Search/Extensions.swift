@@ -267,6 +267,8 @@ final class Extensions: NSObject, ObservableObject {
     private func unload(_ id: String) {
         guard let context = contexts[id] else { return }
         try? controller.unload(context)
+        // Its ports read as gone only once WebKit has had a turn.
+        DispatchQueue.main.async { ExtensionNative.stopOrphans() }
         contexts[id] = nil
         actionsChanged += 1
     }
