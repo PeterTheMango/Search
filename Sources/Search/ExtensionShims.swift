@@ -1704,6 +1704,63 @@ enum ExtensionShims {
         }
       }
 
+      // What one of the extension's pages or its worker posts to another
+      // before their port has opened — at once after connect, or from inside
+      // onConnect — WebKit keeps until the other end takes the port, then
+      // hands on once for each end's world: between two of the extension's
+      // own, the same world, so twice. iCloud Passwords' popup asks its
+      // worker for its state that way, and was answered twice. So between
+      // the extension's own ends every message goes numbered by the end
+      // that sends it, and a number already heard is let go by. A content
+      // script's port, or an app's, goes as it is.
+      if (runtime && typeof runtime.connect === "function" && runtime.onConnect) {
+        const own = runtime.getURL("");
+        const numbered = new WeakSet();
+        // Set on the port itself, not with `put`, which holds what it touches
+        // for good: a port is the extension's to let go. Its onMessage is held
+        // by what is set here, so it isn't made afresh without it.
+        const set = (target, key, value) => { try { Object.defineProperty(target, key, { value, configurable: true, writable: true }); } catch (e) {} };
+        const number = (port) => {
+          const event = port && port.onMessage, post = port && port.postMessage;
+          if (!event || typeof event.addListener !== "function" || typeof post !== "function" || numbered.has(port)) return port;
+          numbered.add(port);
+          const me = Math.random().toString(36).slice(2);
+          let sent = 0;
+          const heard = new Map();
+          const listeners = new Set();
+          event.addListener.call(event, (message, ...rest) => {
+            const tag = message && typeof message === "object" ? message.__searchPort : null;
+            if (Array.isArray(tag)) {
+              if (tag[1] <= (heard.get(tag[0]) || 0)) return;
+              heard.set(tag[0], tag[1]);
+              message = message.message;
+            }
+            for (const f of [...listeners]) { try { f(message, ...rest); } catch (e) { setTimeout(() => { throw e; }); } }
+          });
+          set(port, "postMessage", (message) => post.call(port, { __searchPort: [me, ++sent], message }));
+          set(event, "addListener", (f) => { listeners.add(f); });
+          set(event, "removeListener", (f) => { listeners.delete(f); });
+          set(event, "hasListener", (f) => listeners.has(f));
+          set(event, "hasListeners", () => listeners.size > 0);
+          return port;
+        };
+        const connect = runtime.connect;
+        put(runtime, "connect", (...args) => number(connect.apply(runtime, args)));
+        const onConnect = runtime.onConnect;
+        const add = onConnect.addListener, remove = onConnect.removeListener, has = onConnect.hasListener;
+        const wrapped = new WeakMap();
+        // The worker's sender is the bare origin, with no slash after it.
+        const fromOwn = (port) => !!port && !!port.sender && (String(port.sender.url) + "/").startsWith(own);
+        put(onConnect, "addListener", (listener, ...rest) => {
+          if (typeof listener !== "function") return add.call(onConnect, listener, ...rest);
+          let w = wrapped.get(listener);
+          if (!w) { w = (port) => listener(fromOwn(port) ? number(port) : port); wrapped.set(listener, w); }
+          return add.call(onConnect, w, ...rest);
+        });
+        put(onConnect, "removeListener", (listener) => remove.call(onConnect, wrapped.get(listener) || listener));
+        put(onConnect, "hasListener", (listener) => has.call(onConnect, wrapped.get(listener) || listener));
+      }
+
       // Members of namespaces WebKit has.
       if (chrome.i18n && !chrome.i18n.detectLanguage) put(chrome.i18n, "detectLanguage", call("i18n.detectLanguage"));
       if (runtime && !runtime.getContexts) put(runtime, "getContexts", call("runtime.getContexts"));
