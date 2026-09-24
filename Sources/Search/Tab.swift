@@ -14,7 +14,31 @@ import WebKit
 enum Web {
     /// What every view says it is after "AppleWebKit … (KHTML, like Gecko)"
     /// — web tabs and extension views alike (see Extensions.init).
-    static let userAgentName = "Version/26.5 Safari/605.1.15"
+    ///
+    /// The version is the Safari this Mac has, since its WebKit is the one
+    /// every tab runs on. A fixed number went out of date with every macOS:
+    /// a page told "Safari 26" by an engine that is Safari 18 sends what the
+    /// engine can't run.
+    static let userAgentName = "Version/\(safariVersion) Safari/605.1.15"
+
+    private static var safariVersion: String {
+        for path in ["/System/Cryptexes/App/System/Applications/Safari.app", "/Applications/Safari.app"] {
+            if let version = Bundle(path: path)?.infoDictionary?["CFBundleShortVersionString"] as? String {
+                return version
+            }
+        }
+        // Safari can't be read: say the Safari this macOS shipped with, the
+        // oldest its WebKit can be. Under-claiming gets a page older code
+        // that still runs; over-claiming is what this avoids.
+        //
+        // This hardly ever runs. Safari can't be removed from modern macOS,
+        // so reading the installed Safari above should always work. The
+        // formula only matters if that read fails.
+        //
+        // From macOS 26 Safari shares its number; before, it was 3 ahead (14 -> 17, 15 -> 18).
+        let os = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+        return os >= 26 ? "\(os).0" : "\(os + 3).0"
+    }
 
     /// One pool for every tab. The property is deprecated and said to do
     /// nothing now, but a configuration without it gets a pool of its own
@@ -996,6 +1020,19 @@ final class PageView: WKWebView {
     override func mouseDown(with event: NSEvent) {
         onTouch?()
         super.mouseDown(with: event)
+    }
+
+    /// The side buttons a mouse has for back and forward — button 3 and 4.
+    /// No standard hands out that numbering; it's the X11 button order
+    /// (0 left, 1 right, 2 middle, 3 back, 4 forward) that most mouse
+    /// drivers settled on regardless, so it's what a mouse's own firmware
+    /// is tuned to send.
+    override func otherMouseDown(with event: NSEvent) {
+        switch event.buttonNumber {
+        case 3 where canGoBack: goBack()
+        case 4 where canGoForward: goForward()
+        default: super.otherMouseDown(with: event)
+        }
     }
 
     // MARK: - keys the page didn't use
